@@ -3,9 +3,10 @@
  * Scrape a kwik.cx download page via ScrapingBee, save the download <form> HTML
  * to info/, resolve the direct video URL and download the file into vids/.
  *
- * Usage:
- *   node scripts/kwik-scrape.mjs https://kwik.cx/f/re24o8tskvwT
- *   node scripts/kwik-scrape.mjs <url> --no-download     # only save info/
+ * Add URLs to `to_download` below and run `pnpm run music:scrape`.
+ * For a one-off URL:
+ *   pnpm run music:scrape -- https://kwik.cx/f/re24o8tskvwT
+ * Add `--no-download` to only save info/ metadata.
  *
  * Output:
  *   info/<id>.html   the download form markup
@@ -18,22 +19,90 @@ import { mkdir, writeFile, rename, stat, rm } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createDecipheriv } from "node:crypto";
+import { Client } from "discord.js-selfbot-v13";
 
-const API_KEY =
-  process.env.SCRAPINGBEE_API_KEY ||
-  "QMFT08JLTWYCREUOHAHNJXAZGRN9AD3KMFF5QX9RJYUZIS0YOGFUEWLXBWAPWGJAJ8HHUNBCKEIKXXKS";
+const API_KEY = process.env.SCRAPINGBEE_API_KEY;
+
+if (!API_KEY) {
+  console.error("Missing SCRAPINGBEE_API_KEY. Add it to the environment before running.");
+  process.exit(1);
+}
 
 const INFO_DIR = path.resolve(process.cwd(), "info");
 const VIDS_DIR = path.resolve(process.cwd(), "vids");
+const to_channel = "1540345417911242842";
+const client = new Client();
+
+
+/*
+pnpm run music:scrape
+*/
+
+// URLs are processed in order, one at a time, when the script starts.
+const to_download = [
+   "https://kwik.cx/f/pKkQykaj84O2",
+   "https://kwik.cx/f/Qjfd4HPR8OKc",
+   "https://kwik.cx/f/tBCY77O1Shzc",
+  "https://kwik.cx/f/mYLxlP3ZOrxf",
+  "https://kwik.cx/f/J2E6SVsxYpM8",
+  "https://kwik.cx/f/5rYCQXAfB7hM"
+];
 
 // kwik blocks datacenter IPs, so stealth_proxy is the only reliable route.
 const PROXY_MODES = [{ stealth_proxy: "true" }, { premium_proxy: "true" }, {}];
 const MAX_ATTEMPTS = 5;
 
+function validateDownloadedVideo(videoPath) {
+  const extension = path.extname(videoPath).toLowerCase();
+  const validExtensions = new Set([".mp4", ".mkv", ".avi", ".webm"]);
+  if (!validExtensions.has(extension)) {
+    throw new Error(`Unsupported video file extension: ${extension || "(none)"}`);
+  }
+}
+
+async function loginToDiscord() {
+  const token = process.env.token;
+  if (!token) {
+    throw new Error("Missing token. Add the Discord selfbot token to the environment.");
+  }
+
+  await new Promise((resolve, reject) => {
+    client.once("ready", () => {
+      console.log(`[discord] Logged in as ${client.user.tag}`);
+      resolve();
+    });
+    client.once("error", reject);
+    client.login(token).catch(reject);
+  });
+}
+
+async function postVideoToDiscord(videoPath, episodeNumber) {
+  validateDownloadedVideo(videoPath);
+  const file = await stat(videoPath);
+  if (!file.isFile() || file.size === 0) {
+    throw new Error(`Downloaded video is missing or empty: ${videoPath}`);
+  }
+
+  console.log(`[discord] Preparing upload: ${path.basename(videoPath)}`);
+  console.log(`[discord] Fetching channel ${to_channel}`);
+  const channel = await client.channels.fetch(to_channel);
+  if (!channel || typeof channel.send !== "function") {
+    throw new Error(`Channel ${to_channel} is not available for sending messages`);
+  }
+
+  const episodeLabel = `Episode ${String(episodeNumber).padStart(2, "0")}`;
+  console.log(`[discord] Uploading ${(file.size / 1024 / 1024).toFixed(2)} MB as "${episodeLabel}"`);
+  await channel.send({
+    content: episodeLabel,
+    files: [{ attachment: videoPath, name: path.basename(videoPath) }],
+  });
+  console.log(`[discord] Posted "${episodeLabel}" to channel ${to_channel}`);
+}
+
 function usage(msg) {
-  if (msg) console.error(`Error: ${msg}\n`);
-  console.error("Usage: node scripts/kwik-scrape.mjs <kwik.cx url> [--no-download]");
-  process.exit(1);
+  throw new Error(
+    `${msg}\nUsage: pnpm run music:scrape -- <kwik.cx url> [--no-download]`,
+  );
 }
 
 function beeUrl(params) {
@@ -223,11 +292,14 @@ async function downloadDirectVideo(url, filename, referer) {
   const target = path.join(VIDS_DIR, sanitize(filename));
   const tmp = `${target}.part`;
 
-  console.log(`Downloading ${url}\n  -> ${target}`);
+  console.log(`[download] Starting direct video download`);
+  console.log(`[download] Source: ${url}`);
+  console.log(`[download] Destination: ${target}`);
   await curlGet(url, referer, ["-o", tmp, "--progress-bar"]);
+  console.log(`[download] Download finished, finalizing file`);
   await rename(tmp, target);
   const { size } = await stat(target);
-  console.log(`Saved ${(size / 1024 / 1024).toFixed(2)} MB to ${target}`);
+  console.log(`[download] Saved ${(size / 1024 / 1024).toFixed(2)} MB to ${target}`);
   return target;
 }
 
@@ -236,8 +308,11 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
   const target = path.join(VIDS_DIR, sanitize(filename));
   const tsPath = `${target}.ts.part`;
 
-  console.log(`Downloading HLS stream ${m3u8Url}\n  -> ${target}`);
+  console.log(`[download] Starting HLS download`);
+  console.log(`[download] Manifest: ${m3u8Url}`);
+  console.log(`[download] Destination: ${target}`);
 
+  console.log(`[download] Fetching HLS manifest`);
   const manifest = (await curlGet(m3u8Url, referer)).toString("utf8");
   const base = new URL(m3u8Url);
   const segments = manifest
@@ -246,11 +321,18 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
     .filter((l) => l && !l.startsWith("#"))
     .map((l) => new URL(l, base).href);
   if (!segments.length) throw new Error("HLS manifest contained no segments");
+  console.log(`[download] HLS manifest contains ${segments.length} segment(s)`);
 
   const keyUri = manifest.match(/#EXT-X-KEY:[^\n]*URI="([^"]+)"/)?.[1];
   const ivHex = manifest.match(/#EXT-X-KEY:[^\n]*IV=0x([0-9a-fA-F]+)/)?.[1];
   const seq = Number(manifest.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1] ?? 0);
-  const key = keyUri ? await curlGet(new URL(keyUri, base).href, referer) : null;
+  const key = keyUri
+    ? await (async () => {
+        console.log(`[download] Fetching HLS encryption key`);
+        return curlGet(new URL(keyUri, base).href, referer);
+      })()
+    : null;
+  if (!key) console.log(`[download] HLS stream is not encrypted`);
 
   const out = createWriteStream(tsPath);
   const CONCURRENCY = 8;
@@ -283,7 +365,7 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
       buffers[i] = data;
       done++;
       if (done % 10 === 0 || done === segments.length) {
-        process.stdout.write(`\r  segments ${done}/${segments.length}`);
+        process.stdout.write(`\r[download] Segments ${done}/${segments.length}`);
       }
       await flush();
     }
@@ -293,6 +375,7 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
   await flush();
   await new Promise((r) => out.end(r));
   process.stdout.write("\n");
+  console.log(`[download] All HLS segments assembled, remuxing with ffmpeg`);
 
   // Remux the concatenated MPEG-TS into a proper mp4 container.
   await new Promise((resolve, reject) => {
@@ -311,30 +394,29 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
   await rm(tsPath, { force: true });
 
   const { size } = await stat(target);
-  console.log(`Saved ${(size / 1024 / 1024).toFixed(2)} MB to ${target}`);
+  console.log(`[download] Saved ${(size / 1024 / 1024).toFixed(2)} MB to ${target}`);
   return target;
 }
 
 
-async function main() {
-  const args = process.argv.slice(2);
-  const noDownload = args.includes("--no-download");
-  const url = args.find((a) => !a.startsWith("--"));
-  if (!url) usage("missing url");
+async function scrapeAndDownload(url, noDownload, episodeNumber) {
+  console.log(`[scrape] Validating URL`);
   if (!/^https?:\/\/kwik\.[a-z.]+\/f\/[A-Za-z0-9]+/i.test(url)) {
     usage("expected a url like https://kwik.cx/f/re24o8tskvwT");
   }
 
   const id = url.replace(/\/+$/, "").split("/").pop();
+  console.log(`[scrape] Preparing output directories for ${id}`);
   await mkdir(INFO_DIR, { recursive: true });
 
   // 1. Load the file page until the (JS-injected) download form is present.
   let page = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    console.log(`Fetching ${url} via ScrapingBee (attempt ${attempt}/${MAX_ATTEMPTS})...`);
+    console.log(`[scrape] Fetching source page via ScrapingBee (attempt ${attempt}/${MAX_ATTEMPTS})`);
     const result = await beeGet(url, { json: true });
     if (extractForm(result.html)) {
       page = result;
+      console.log(`[scrape] Download form found`);
       break;
     }
     console.warn("  download form not present yet (Cloudflare interstitial), retrying...");
@@ -343,21 +425,23 @@ async function main() {
 
   const form = extractForm(page.html);
   const filename = extractFilename(page.html) ?? `${id}.mp4`;
+  console.log(`[scrape] Found file: ${filename}${form.size ? ` (${form.size})` : ""}`);
 
   // 2. Resolve the real video URL via the embed player page.
   let videoUrl = null;
   let embedPage = null;
   const embedUrl = extractEmbedUrl(page.html);
   if (embedUrl) {
-    console.log(`Loading embed player ${embedUrl}...`);
+    console.log(`[scrape] Loading embedded player`);
     embedPage = await beeGetEmbed(embedUrl, page.cookies);
     videoUrl = extractVideoUrl(embedPage.html, embedPage.xhr);
-    console.log(videoUrl ? `Video URL: ${videoUrl}` : "Could not resolve a direct video URL");
+    console.log(videoUrl ? `[scrape] Media URL resolved` : "[scrape] Could not resolve a media URL");
   } else {
     console.warn("Could not find embed URL on the file page.");
   }
 
   // 3. Persist the scraped info.
+  console.log(`[scrape] Writing metadata to info/`);
   await writeFile(path.join(INFO_DIR, `${id}.html`), form.html + "\n", "utf8");
   await writeFile(
     path.join(INFO_DIR, `${id}.json`),
@@ -380,8 +464,8 @@ async function main() {
     ) + "\n",
     "utf8",
   );
-  console.log(form.html);
-  console.log(`\nSaved info to ${path.join(INFO_DIR, `${id}.html`)} and ${path.join(INFO_DIR, `${id}.json`)}`);
+  console.log(`[scrape] Saved ${path.join(INFO_DIR, `${id}.html`)}`);
+  console.log(`[scrape] Saved ${path.join(INFO_DIR, `${id}.json`)}`);
 
   if (embedPage && !videoUrl) {
     const dump = path.join(INFO_DIR, `${id}.embed-page.html`);
@@ -390,17 +474,68 @@ async function main() {
   }
 
   // 4. Download the video.
-  if (noDownload) return;
+  if (noDownload) {
+    console.log(`[scrape] Metadata-only mode enabled; download skipped`);
+    return;
+  }
   if (!videoUrl) {
-    console.error("No video URL resolved — skipping download.");
-    process.exit(2);
+    throw new Error("No video URL resolved");
   }
 
+  console.log(`[scrape] Starting video download`);
+  let downloadedPath;
   if (/\.m3u8(\?|$)/i.test(videoUrl)) {
-    await downloadHlsVideo(videoUrl, filename, embedUrl ?? url);
+    downloadedPath = await downloadHlsVideo(videoUrl, filename, embedUrl ?? url);
   } else {
-    await downloadDirectVideo(videoUrl, filename, embedUrl ?? url);
+    downloadedPath = await downloadDirectVideo(videoUrl, filename, embedUrl ?? url);
   }
+  console.log(`[scrape] Valid video downloaded; sending to Discord`);
+  await postVideoToDiscord(downloadedPath, episodeNumber);
+  console.log(`[scrape] Completed ${url}`);
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const noDownload = args.includes("--no-download");
+  const commandLineUrls = args.filter((arg) => !arg.startsWith("--"));
+  const urls = commandLineUrls.length ? commandLineUrls : to_download;
+
+  if (!urls.length) {
+    console.log("No URLs queued. Add kwik.cx URLs to the to_download array in index.js.");
+    return;
+  }
+
+  console.log(`[queue] Found ${urls.length} URL(s); processing sequentially`);
+  if (!noDownload) {
+    console.log(`[discord] Connecting before processing the download queue`);
+    await loginToDiscord();
+  } else {
+    console.log(`[discord] Metadata-only mode; Discord login skipped`);
+  }
+
+  let failed = 0;
+  for (const [index, url] of urls.entries()) {
+    console.log(`\n[queue] Starting ${index + 1}/${urls.length}: ${url}`);
+    try {
+      await scrapeAndDownload(url, noDownload, index + 1);
+      console.log(`[queue] Finished ${index + 1}/${urls.length}`);
+    } catch (err) {
+      failed++;
+      console.error(`Failed: ${err.message}`);
+      console.error("Continuing with the next URL...");
+    }
+  }
+
+  if (failed) {
+    throw new Error(`${failed} of ${urls.length} download(s) failed`);
+  }
+
+  if (!noDownload) {
+    console.log(`[queue] All videos posted successfully; deleting vids/`);
+    await rm(VIDS_DIR, { recursive: true, force: true });
+    console.log(`[queue] Deleted ${VIDS_DIR}`);
+  }
+  console.log(`[queue] All ${urls.length} URL(s) processed successfully`);
 }
 
 main().catch((err) => {
