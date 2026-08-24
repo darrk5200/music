@@ -1,21 +1,30 @@
 #!/usr/bin/env node
 /**
- * Scrape a kwik.cx download page via ScrapingBee, save the download <form> HTML
- * to info/, resolve the direct video URL and download the file into vids/.
+ * patch.js — https://github.com/darrk5200/music index.js with the
+ * ScrapingBee credit-saving changes applied.
  *
- * Add URLs to `to_download` below and run `pnpm run music:scrape`.
- * For a one-off URL:
- *   pnpm run music:scrape -- https://kwik.cx/f/re24o8tskvwT
- * Add `--no-download` to only save info/ metadata.
+ * What changed vs the upstream repo file:
+ *   1. The /e/ embed page is NOT Cloudflare-protected, so it is fetched with
+ *      plain curl. The expensive render_js + XHR-capture ScrapingBee call is
+ *      gone (it was the biggest cost per URL). The media URL is now recovered
+ *      by unpacking the embed page's eval(function(p,a,c,k,e,d)) blocks
+ *      locally.
+ *   2. The /f/ page is first tried with a free direct curl; ScrapingBee is only
+ *      used if that is blocked.
+ *   3. Proxy tiers escalate cheap -> expensive (classic 1cr, premium 25cr,
+ *      stealth 75cr) and stop at the first success, instead of always starting
+ *      at stealth with 5 retries.
+ *   4. info/<id>.json is reused as a cache (0 credits); pass --refresh to
+ *      re-scrape.
+ *   5. Each run reports the credits it actually spent.
  *
- * Output:
- *   info/<id>.html   the download form markup
- *   info/<id>.json   parsed action / _token / size / resolved video url
- *   vids/<filename>  the downloaded video
+ * Usage:
+ *   node patch.js
+ *   node patch.js https://kwik.cx/f/re24o8tskvwT [--no-download] [--refresh]
  */
 
 import { createWriteStream } from "node:fs";
-import { mkdir, writeFile, rename, stat, rm } from "node:fs/promises";
+import { mkdir, writeFile, readFile, rename, stat, rm } from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createDecipheriv } from "node:crypto";
@@ -33,24 +42,26 @@ const VIDS_DIR = path.resolve(process.cwd(), "vids");
 const to_channel = "1540345417911242842";
 const client = new Client();
 
-
-/*
-pnpm run music:scrape
-*/
-
 // URLs are processed in order, one at a time, when the script starts.
 const to_download = [
-   "https://kwik.cx/f/pKkQykaj84O2",
-   "https://kwik.cx/f/Qjfd4HPR8OKc",
-   "https://kwik.cx/f/tBCY77O1Shzc",
+  "https://kwik.cx/f/pKkQykaj84O2",
+  "https://kwik.cx/f/Qjfd4HPR8OKc",
+  "https://kwik.cx/f/tBCY77O1Shzc",
   "https://kwik.cx/f/mYLxlP3ZOrxf",
   "https://kwik.cx/f/J2E6SVsxYpM8",
-  "https://kwik.cx/f/5rYCQXAfB7hM"
+  "https://kwik.cx/f/5rYCQXAfB7hM",
 ];
 
-// kwik blocks datacenter IPs, so stealth_proxy is the only reliable route.
-const PROXY_MODES = [{ stealth_proxy: "true" }, { premium_proxy: "true" }, {}];
-const MAX_ATTEMPTS = 5;
+/**
+ * Credit budget. ScrapingBee bills per request by proxy tier:
+ *   classic         =  1 credit   (+ render_js is free)
+ *   premium_proxy   = 25 credits
+ *   stealth_proxy   = 75 credits
+ * So we always escalate cheap -> expensive and stop at the first success.
+ * Only the /f/ page needs ScrapingBee at all; everything else is plain curl.
+ */
+const PROXY_MODES = [{}, { premium_proxy: "true" }, { stealth_proxy: "true" }];
+const MAX_ATTEMPTS = 1; // per proxy tier; the tier escalation is the retry
 
 function validateDownloadedVideo(videoPath) {
   const extension = path.extname(videoPath).toLowerCase();
@@ -100,9 +111,7 @@ async function postVideoToDiscord(videoPath, episodeNumber) {
 }
 
 function usage(msg) {
-  throw new Error(
-    `${msg}\nUsage: pnpm run music:scrape -- <kwik.cx url> [--no-download]`,
-  );
+  throw new Error(`${msg}\nUsage: node patch.js <kwik.cx url> [--no-download] [--refresh]`);
 }
 
 function beeUrl(params) {
@@ -113,64 +122,69 @@ function beeUrl(params) {
   return endpoint;
 }
 
-/** GET a page through ScrapingBee, returning { html, cookies }. */
-async function beeGet(url, { json = false } = {}) {
+/**
+ * Load the /f/ page. Tries a free direct curl first (works whenever kwik's
+ * Cloudflare rule is relaxed), then escalates through ScrapingBee tiers.
+ * Returns { html, cookies, cost }.
+ */
+async function fetchFilePage(url) {
+  // 0 credits: direct hit.
+  try {
+    const html = (await curlGet(url, "https://animepahe.ru/")).toString("utf8");
+    if (extractForm(html)) {
+      console.log("[scrape] Fetched directly (0 ScrapingBee credits).");
+      return { html, cookies: [], cost: 0 };
+    }
+  } catch {
+    /* blocked, fall through to ScrapingBee */
+  }
+
   let lastError;
   for (const proxy of PROXY_MODES) {
-    const res = await fetch(
-      beeUrl({
-        url,
-        render_js: "true",
-        wait: "15000",
-        wait_for: ".button",
-        block_resources: "false",
-        json_response: json ? "true" : undefined,
-        ...proxy,
-      }),
-    );
-    const body = await res.text();
-    if (!res.ok) {
-      lastError = `ScrapingBee GET failed [${res.status}] (${JSON.stringify(proxy)}): ${body.slice(0, 300)}`;
-      console.warn(lastError);
-      continue;
+    const tier = proxy.stealth_proxy
+      ? "stealth (75cr)"
+      : proxy.premium_proxy
+        ? "premium (25cr)"
+        : "classic (1cr)";
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      console.log(`[scrape] ScrapingBee GET ${tier}...`);
+      const res = await fetch(
+        beeUrl({
+          url,
+          render_js: "true",
+          wait: "8000",
+          wait_for: ".button",
+          json_response: "true",
+          ...proxy,
+        }),
+      );
+      const body = await res.text();
+      if (!res.ok) {
+        lastError = `ScrapingBee GET failed [${res.status}] (${tier}): ${body.slice(0, 200)}`;
+        console.warn(lastError);
+        continue;
+      }
+      const data = JSON.parse(body);
+      const html = typeof data.body === "string" ? data.body : "";
+      if (!extractForm(html)) {
+        lastError = `${tier}: download form not present (Cloudflare interstitial)`;
+        console.warn(lastError);
+        continue;
+      }
+      return {
+        html,
+        cookies: data.cookies ?? [],
+        cost: proxy.stealth_proxy ? 75 : proxy.premium_proxy ? 25 : 1,
+      };
     }
-    if (!json) return { html: body, cookies: [] };
-    const data = JSON.parse(body);
-    const html = typeof data.body === "string" ? data.body : "";
-    return { html, cookies: data.cookies ?? [] };
   }
-  throw new Error(lastError);
+  throw new Error(lastError ?? "could not load the kwik download form");
 }
 
-/** GET the embed player page through ScrapingBee, returning { html, xhr }. */
-async function beeGetEmbed(url, cookies) {
-  const cookieHeader = (cookies ?? []).map((c) => `${c.name}=${c.value}`).join(";");
-  let lastError;
-  for (const proxy of PROXY_MODES) {
-    const res = await fetch(
-      beeUrl({
-        url,
-        render_js: "true",
-        wait: "10000",
-        block_resources: "false",
-        json_response: "true",
-        cookies: cookieHeader || undefined,
-        ...proxy,
-      }),
-    );
-    const body = await res.text();
-    if (!res.ok) {
-      lastError = `ScrapingBee embed GET failed [${res.status}] (${JSON.stringify(proxy)}): ${body.slice(0, 300)}`;
-      console.warn(lastError);
-      continue;
-    }
-    const data = JSON.parse(body);
-    return {
-      html: typeof data.body === "string" ? data.body : "",
-      xhr: data.xhr ?? [],
-    };
-  }
-  throw new Error(lastError);
+/** The /e/ embed page is NOT Cloudflare-protected: fetch it with curl for free. */
+async function fetchEmbedPage(url) {
+  const html = (await curlGet(url, "https://kwik.cx/")).toString("utf8");
+  return { html };
 }
 
 function extractForm(html) {
@@ -226,21 +240,35 @@ function extractEmbedUrl(html) {
   return null;
 }
 
-/** Find the direct media URL from the embed page's captured XHR or HTML. */
-function extractVideoUrl(html, xhr) {
-  // 1. XHR captures the actual HLS manifest request.
-  const m3u8 = xhr.find((r) => /\.m3u8(\?|$)/i.test(r.url))?.url;
-  if (m3u8) return m3u8;
-  const mp4 = xhr.find((r) => /\.(mp4|mkv|avi|webm)(\?|$)/i.test(r.url))?.url;
-  if (mp4) return mp4;
+/**
+ * Find the direct media URL in the embed page by unpacking its
+ * eval(function(p,a,c,k,e,d)) blocks locally — no render_js request needed.
+ */
+function extractVideoUrl(html) {
+  for (const match of html.matchAll(/eval\(function\(p,a,c,k,e/g)) {
+    const end = html.indexOf("</script>", match.index);
+    const code = html
+      .slice(match.index, end === -1 ? undefined : end)
+      .trim()
+      .replace(/^eval\(/, "(")
+      .replace(/;\s*$/, "");
+    let decoded;
+    try {
+      decoded = new Function(`return ${code}`)();
+    } catch {
+      continue;
+    }
+    const found = String(decoded).match(
+      /https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mp4|mkv|avi|webm)(?:\?[^\s"'<>\\]*)?/i,
+    );
+    if (found) return found[0].replace(/&amp;/g, "&");
+  }
 
-  // 2. Fallback to scanning the rendered HTML.
+  // Fallback: the URL is sometimes plainly visible.
   const direct = html.match(
     /https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mp4|mkv|avi|webm)(?:\?[^\s"'<>\\]*)?/i,
   );
-  if (direct) return direct[0].replace(/&amp;/g, "&");
-
-  return null;
+  return direct ? direct[0].replace(/&amp;/g, "&") : null;
 }
 
 function sanitize(name) {
@@ -398,53 +426,68 @@ async function downloadHlsVideo(m3u8Url, filename, referer) {
   return target;
 }
 
-
-async function scrapeAndDownload(url, noDownload, episodeNumber) {
+async function scrapeAndDownload(url, noDownload, episodeNumber, refresh) {
   console.log(`[scrape] Validating URL`);
   if (!/^https?:\/\/kwik\.[a-z.]+\/f\/[A-Za-z0-9]+/i.test(url)) {
     usage("expected a url like https://kwik.cx/f/re24o8tskvwT");
   }
 
   const id = url.replace(/\/+$/, "").split("/").pop();
-  console.log(`[scrape] Preparing output directories for ${id}`);
   await mkdir(INFO_DIR, { recursive: true });
+  const infoPath = path.join(INFO_DIR, `${id}.json`);
 
-  // 1. Load the file page until the (JS-injected) download form is present.
-  let page = null;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    console.log(`[scrape] Fetching source page via ScrapingBee (attempt ${attempt}/${MAX_ATTEMPTS})`);
-    const result = await beeGet(url, { json: true });
-    if (extractForm(result.html)) {
-      page = result;
-      console.log(`[scrape] Download form found`);
-      break;
+  // 0. Reuse a previous scrape (0 credits) unless --refresh was passed.
+  let cached = null;
+  if (!refresh) {
+    try {
+      cached = JSON.parse(await readFile(infoPath, "utf8"));
+    } catch {
+      /* no cache */
     }
-    console.warn("  download form not present yet (Cloudflare interstitial), retrying...");
   }
-  if (!page) throw new Error("Could not load the kwik download form after several attempts");
 
-  const form = extractForm(page.html);
-  const filename = extractFilename(page.html) ?? `${id}.mp4`;
+  let form;
+  let filename;
+  let embedUrl;
+  let cost = 0;
+  if (cached?.embed_url) {
+    console.log(`[scrape] Reusing cached info from ${infoPath} (0 credits; --refresh to re-scrape).`);
+    form = {
+      html: cached.html,
+      action: cached.action,
+      method: cached.method,
+      token: cached._token,
+      label: cached.label,
+      size: cached.size,
+    };
+    filename = cached.filename;
+    embedUrl = cached.embed_url;
+  } else {
+    // 1. Load the file page (the only step that can cost credits).
+    const page = await fetchFilePage(url);
+    cost = page.cost;
+    form = extractForm(page.html);
+    filename = extractFilename(page.html) ?? `${id}.mp4`;
+    embedUrl = extractEmbedUrl(page.html);
+    if (!embedUrl) console.warn("[scrape] Could not find embed URL on the file page.");
+  }
   console.log(`[scrape] Found file: ${filename}${form.size ? ` (${form.size})` : ""}`);
 
-  // 2. Resolve the real video URL via the embed player page.
+  // 2. Resolve the real video URL from the embed page — plain curl, 0 credits.
   let videoUrl = null;
-  let embedPage = null;
-  const embedUrl = extractEmbedUrl(page.html);
+  let embedHtml = null;
   if (embedUrl) {
-    console.log(`[scrape] Loading embedded player`);
-    embedPage = await beeGetEmbed(embedUrl, page.cookies);
-    videoUrl = extractVideoUrl(embedPage.html, embedPage.xhr);
+    console.log(`[scrape] Loading embedded player ${embedUrl} (direct, 0 credits)...`);
+    embedHtml = (await fetchEmbedPage(embedUrl)).html;
+    videoUrl = extractVideoUrl(embedHtml);
     console.log(videoUrl ? `[scrape] Media URL resolved` : "[scrape] Could not resolve a media URL");
-  } else {
-    console.warn("Could not find embed URL on the file page.");
   }
 
   // 3. Persist the scraped info.
   console.log(`[scrape] Writing metadata to info/`);
   await writeFile(path.join(INFO_DIR, `${id}.html`), form.html + "\n", "utf8");
   await writeFile(
-    path.join(INFO_DIR, `${id}.json`),
+    infoPath,
     JSON.stringify(
       {
         source: url,
@@ -465,18 +508,19 @@ async function scrapeAndDownload(url, noDownload, episodeNumber) {
     "utf8",
   );
   console.log(`[scrape] Saved ${path.join(INFO_DIR, `${id}.html`)}`);
-  console.log(`[scrape] Saved ${path.join(INFO_DIR, `${id}.json`)}`);
+  console.log(`[scrape] Saved ${infoPath}`);
+  console.log(`[scrape] ScrapingBee credits used for this URL: ${cost}`);
 
-  if (embedPage && !videoUrl) {
+  if (embedHtml && !videoUrl) {
     const dump = path.join(INFO_DIR, `${id}.embed-page.html`);
-    await writeFile(dump, embedPage.html, "utf8");
+    await writeFile(dump, embedHtml, "utf8");
     console.error(`Embed page saved to ${dump} for inspection`);
   }
 
   // 4. Download the video.
   if (noDownload) {
     console.log(`[scrape] Metadata-only mode enabled; download skipped`);
-    return;
+    return cost;
   }
   if (!videoUrl) {
     throw new Error("No video URL resolved");
@@ -492,16 +536,18 @@ async function scrapeAndDownload(url, noDownload, episodeNumber) {
   console.log(`[scrape] Valid video downloaded; sending to Discord`);
   await postVideoToDiscord(downloadedPath, episodeNumber);
   console.log(`[scrape] Completed ${url}`);
+  return cost;
 }
 
 async function main() {
   const args = process.argv.slice(2);
   const noDownload = args.includes("--no-download");
+  const refresh = args.includes("--refresh");
   const commandLineUrls = args.filter((arg) => !arg.startsWith("--"));
   const urls = commandLineUrls.length ? commandLineUrls : to_download;
 
   if (!urls.length) {
-    console.log("No URLs queued. Add kwik.cx URLs to the to_download array in index.js.");
+    console.log("No URLs queued. Add kwik.cx URLs to the to_download array in patch.js.");
     return;
   }
 
@@ -514,10 +560,11 @@ async function main() {
   }
 
   let failed = 0;
+  let totalCost = 0;
   for (const [index, url] of urls.entries()) {
     console.log(`\n[queue] Starting ${index + 1}/${urls.length}: ${url}`);
     try {
-      await scrapeAndDownload(url, noDownload, index + 1);
+      totalCost += (await scrapeAndDownload(url, noDownload, index + 1, refresh)) ?? 0;
       console.log(`[queue] Finished ${index + 1}/${urls.length}`);
     } catch (err) {
       failed++;
@@ -525,6 +572,8 @@ async function main() {
       console.error("Continuing with the next URL...");
     }
   }
+
+  console.log(`[queue] Total ScrapingBee credits used this run: ${totalCost}`);
 
   if (failed) {
     throw new Error(`${failed} of ${urls.length} download(s) failed`);
